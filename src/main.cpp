@@ -14,6 +14,24 @@
 // Safety buffer - stop this many steps before the deployed limit switch
 #define DEFAULT_SAFETY_BUFFER 200
 
+// Multi-threading Configuration
+// Core 0: Web server and WiFi (less time-critical)
+// Core 1: Motor control and serial commands (time-critical for smooth stepping)
+TaskHandle_t webServerTaskHandle = NULL;
+TaskHandle_t motorControlTaskHandle = NULL;
+SemaphoreHandle_t positionMutex = NULL; // Protects position variables
+SemaphoreHandle_t commandMutex = NULL;  // Protects command queue
+
+// Command queue for thread-safe motor control
+enum MotorCommand
+{
+  CMD_NONE,
+  CMD_DEPLOY,
+  CMD_RETRACT,
+  CMD_CALIBRATE
+};
+volatile MotorCommand pendingCommand = CMD_NONE;
+
 // Pin Definitions
 #define EN_PIN 4   // LOW: Driver enabled, HIGH: Driver disabled
 #define STEP_PIN 5 // Step on the rising edge
@@ -40,6 +58,8 @@ long safetyBuffer = DEFAULT_SAFETY_BUFFER; // Steps to stop before deployed limi
 bool isCalibrated = false;                 // Calibration status
 
 // Function Declarations
+void webServerTask(void *parameter);
+void motorControlTask(void *parameter);
 void moveSteps(int steps, bool checkLimits = true);
 void calibrate();
 void deploy();
@@ -54,10 +74,26 @@ void setupWiFi();
 void setupWebServer();
 void checkWiFiConnection();
 String getStatusJSON();
+void queueCommand(MotorCommand cmd);
+long getPosition();         // Thread-safe position getter
+void setPosition(long pos); // Thread-safe position setter
 
 void setup()
 {
   Serial.begin(115200);
+
+  // Create mutexes for thread synchronization
+  positionMutex = xSemaphoreCreateMutex();
+  commandMutex = xSemaphoreCreateMutex();
+
+  if (positionMutex == NULL || commandMutex == NULL)
+  {
+    Serial.println("FATAL: Failed to create mutexes!");
+    while (1)
+    {
+      delay(1000);
+    } // Halt
+  }
 
   // Configure pin modes
   pinMode(EN_PIN, OUTPUT);
@@ -72,6 +108,7 @@ void setup()
 
   Serial.println("Bird Blinds Controller Started");
   Serial.println("TMC2209 in standalone mode (STEP/DIR control)");
+  Serial.println("Multi-threaded: Core 0 = Web, Core 1 = Motor");
 
   // Check limit switch states
   Serial.println("\n=== Limit Switch Diagnostics ===");
@@ -85,12 +122,6 @@ void setup()
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
-
-  // Setup WiFi
-  setupWiFi();
-
-  // Setup Web Server
-  setupWebServer();
 
   // Try to load stored calibration
   if (loadCalibrationFromEEPROM())
@@ -111,81 +142,213 @@ void setup()
   }
 
   Serial.println("Commands: 'd' = deploy, 'r' = retract, 'c' = calibrate");
+
+  // Create motor control task on Core 1 (time-critical)
+  xTaskCreatePinnedToCore(
+      motorControlTask,        // Task function
+      "MotorControl",          // Task name
+      8192,                    // Stack size (bytes)
+      NULL,                    // Parameters
+      2,                       // Priority (2 = high)
+      &motorControlTaskHandle, // Task handle
+      1                        // Core 1
+  );
+
+  // Create web server task on Core 0 (less critical)
+  xTaskCreatePinnedToCore(
+      webServerTask,        // Task function
+      "WebServer",          // Task name
+      8192,                 // Stack size (bytes)
+      NULL,                 // Parameters
+      1,                    // Priority (1 = normal)
+      &webServerTaskHandle, // Task handle
+      0                     // Core 0
+  );
+
+  Serial.println("\nTasks created:");
+  Serial.println("  - Motor Control Task (Core 1, Priority 2)");
+  Serial.println("  - Web Server Task (Core 0, Priority 1)");
 }
 
 void loop()
 {
-  // Monitor WiFi connection status
-  checkWiFiConnection();
+  // Main loop is now empty - all work is done in tasks
+  // Keep loop alive but idle
+  vTaskDelay(pdMS_TO_TICKS(1000));
+}
 
-  // Check for serial commands
-  if (Serial.available() > 0)
+// ========================================
+// MOTOR CONTROL TASK (Core 1)
+// ========================================
+void motorControlTask(void *parameter)
+{
+  Serial.println("[Motor Task] Started on core 1");
+
+  while (true)
   {
-    char cmd = Serial.read();
-
-    switch (cmd)
+    // Check for serial commands
+    if (Serial.available() > 0)
     {
-    case 'd':
-    case 'D':
-      Serial.println("Deploying blinds...");
-      deploy();
-      Serial.println("Blinds deployed");
-      break;
+      char cmd = Serial.read();
 
-    case 'r':
-    case 'R':
-      Serial.println("Retracting blinds...");
-      retract();
-      Serial.println("Blinds retracted");
-      break;
-
-    case 'c':
-    case 'C':
-      Serial.println("Starting calibration...");
-      calibrate();
-      Serial.println("Calibration complete");
-      break;
-
-    case 's':
-    case 'S':
-      // Status command - check limit switches
-      Serial.println("\n=== Current Status ===");
-      Serial.print("LIMIT_RETRACTED: ");
-      Serial.println(digitalRead(LIMIT_RETRACTED) == LOW ? "TRIGGERED" : "NOT TRIGGERED");
-      Serial.print("LIMIT_DEPLOYED: ");
-      Serial.println(digitalRead(LIMIT_DEPLOYED) == LOW ? "TRIGGERED" : "NOT TRIGGERED");
-      Serial.print("Current position: ");
-      Serial.println(currentPosition);
-      Serial.print("Calibrated: ");
-      Serial.println(isCalibrated ? "YES" : "NO");
-      if (isCalibrated)
+      switch (cmd)
       {
-        Serial.print("Range: ");
-        Serial.print(retractedPosition);
-        Serial.print(" to ");
-        Serial.println(deployedPosition);
-      }
-      Serial.println("====================\n");
-      break;
+      case 'd':
+      case 'D':
+        Serial.println("Deploying blinds...");
+        deploy();
+        Serial.println("Blinds deployed");
+        break;
 
-    case 't':
-    case 'T':
-      // Test motor movement - 100 steps forward
-      Serial.println("Test: Moving 100 steps forward...");
-      digitalWrite(DIR_PIN, HIGH);
-      for (int i = 0; i < 100; i++)
-      {
-        digitalWrite(STEP_PIN, HIGH);
-        delayMicroseconds(SPEED_DELAY);
-        digitalWrite(STEP_PIN, LOW);
-        delayMicroseconds(SPEED_DELAY);
+      case 'r':
+      case 'R':
+        Serial.println("Retracting blinds...");
+        retract();
+        Serial.println("Blinds retracted");
+        break;
+
+      case 'c':
+      case 'C':
+        Serial.println("Starting calibration...");
+        calibrate();
+        Serial.println("Calibration complete");
+        break;
+
+      case 's':
+      case 'S':
+        // Status command - check limit switches
+        Serial.println("\n=== Current Status ===");
+        Serial.print("LIMIT_RETRACTED: ");
+        Serial.println(digitalRead(LIMIT_RETRACTED) == LOW ? "TRIGGERED" : "NOT TRIGGERED");
+        Serial.print("LIMIT_DEPLOYED: ");
+        Serial.println(digitalRead(LIMIT_DEPLOYED) == LOW ? "TRIGGERED" : "NOT TRIGGERED");
+        Serial.print("Current position: ");
+        Serial.println(getPosition());
+        Serial.print("Calibrated: ");
+        Serial.println(isCalibrated ? "YES" : "NO");
+        if (isCalibrated)
+        {
+          Serial.print("Range: ");
+          Serial.print(retractedPosition);
+          Serial.print(" to ");
+          Serial.println(deployedPosition);
+        }
+        Serial.print("Running on core: ");
+        Serial.println(xPortGetCoreID());
+        Serial.println("====================\n");
+        break;
+
+      case 't':
+      case 'T':
+        // Test motor movement - 100 steps forward
+        Serial.println("Test: Moving 100 steps forward...");
+        digitalWrite(DIR_PIN, HIGH);
+        for (int i = 0; i < 100; i++)
+        {
+          digitalWrite(STEP_PIN, HIGH);
+          delayMicroseconds(SPEED_DELAY);
+          digitalWrite(STEP_PIN, LOW);
+          delayMicroseconds(SPEED_DELAY);
+        }
+        Serial.println("Test complete. Did motor move?");
+        break;
       }
-      Serial.println("Test complete. Did motor move?");
-      break;
     }
+
+    // Check for queued commands from web interface
+    if (xSemaphoreTake(commandMutex, pdMS_TO_TICKS(10)) == pdTRUE)
+    {
+      MotorCommand cmd = pendingCommand;
+      pendingCommand = CMD_NONE;
+      xSemaphoreGive(commandMutex);
+
+      switch (cmd)
+      {
+      case CMD_DEPLOY:
+        Serial.println("[Web] Deploying blinds...");
+        deploy();
+        Serial.println("[Web] Blinds deployed");
+        break;
+
+      case CMD_RETRACT:
+        Serial.println("[Web] Retracting blinds...");
+        retract();
+        Serial.println("[Web] Blinds retracted");
+        break;
+
+      case CMD_CALIBRATE:
+        Serial.println("[Web] Starting calibration...");
+        calibrate();
+        Serial.println("[Web] Calibration complete");
+        break;
+
+      case CMD_NONE:
+        // No command pending
+        break;
+      }
+    }
+
+    // Small delay to prevent task from hogging CPU
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
+// ========================================
+// WEB SERVER TASK (Core 0)
+// ========================================
+void webServerTask(void *parameter)
+{
+  Serial.println("[Web Task] Started on core 0");
+
+  // Setup WiFi and Web Server on Core 0
+  setupWiFi();
+  setupWebServer();
+
+  while (true)
+  {
+    // Monitor WiFi connection status
+    checkWiFiConnection();
+
+    // Delay to prevent task from hogging CPU
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
+// ========================================
+// THREAD-SAFE HELPER FUNCTIONS
+// ========================================
+void queueCommand(MotorCommand cmd)
+{
+  if (xSemaphoreTake(commandMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+  {
+    pendingCommand = cmd;
+    xSemaphoreGive(commandMutex);
+  }
+}
+
+long getPosition()
+{
+  long pos = 0;
+  if (xSemaphoreTake(positionMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+  {
+    pos = currentPosition;
+    xSemaphoreGive(positionMutex);
+  }
+  return pos;
+}
+
+void setPosition(long pos)
+{
+  if (xSemaphoreTake(positionMutex, pdMS_TO_TICKS(100)) == pdTRUE)
+  {
+    currentPosition = pos;
+    xSemaphoreGive(positionMutex);
+  }
+}
+
+// ========================================
+// MOTOR CONTROL FUNCTIONS
+// ========================================
 void moveSteps(int steps, bool checkLimits)
 {
   if (steps == 0)
@@ -208,19 +371,20 @@ void moveSteps(int steps, bool checkLimits)
         Serial.println("WARNING: Deployed limit switch triggered!");
 
         // Update the deployed endpoint if we hit the switch unexpectedly
-        if (currentPosition != deployedPosition)
+        long currPos = getPosition();
+        if (currPos != deployedPosition)
         {
           Serial.print("Updating deployed endpoint from ");
           Serial.print(deployedPosition);
           Serial.print(" to ");
-          Serial.println(currentPosition);
+          Serial.println(currPos);
 
-          deployedPosition = currentPosition;
+          deployedPosition = currPos;
           safeDeployedPosition = deployedPosition - safetyBuffer;
           saveCalibrationToEEPROM();
         }
 
-        currentPosition = deployedPosition;
+        setPosition(deployedPosition);
         return;
       }
       if (!forward && isRetractedLimitHit())
@@ -228,10 +392,11 @@ void moveSteps(int steps, bool checkLimits)
         Serial.println("Retracted limit reached");
 
         // Always reset to zero when retracted limit is hit
-        if (currentPosition != 0)
+        long currPos = getPosition();
+        if (currPos != 0)
         {
           Serial.println("Resetting position to 0");
-          currentPosition = 0;
+          setPosition(0);
           retractedPosition = 0;
         }
         return;
@@ -243,8 +408,12 @@ void moveSteps(int steps, bool checkLimits)
     digitalWrite(STEP_PIN, LOW);
     delayMicroseconds(SPEED_DELAY);
 
-    // Update position
-    currentPosition += forward ? 1 : -1;
+    // Update position (thread-safe)
+    if (xSemaphoreTake(positionMutex, pdMS_TO_TICKS(1)) == pdTRUE)
+    {
+      currentPosition += forward ? 1 : -1;
+      xSemaphoreGive(positionMutex);
+    }
   }
 }
 
@@ -273,7 +442,7 @@ void calibrate()
   }
 
   // Set retracted position as zero
-  currentPosition = 0;
+  setPosition(0);
   retractedPosition = 0;
 
   delay(500); // Brief pause
@@ -300,7 +469,7 @@ void calibrate()
 
   // Set deployed position
   deployedPosition = stepCount;
-  currentPosition = deployedPosition;
+  setPosition(deployedPosition);
 
   // Calculate safe deployed position (stop before limit switch)
   safeDeployedPosition = deployedPosition - safetyBuffer;
@@ -351,7 +520,7 @@ void retract()
 
 void moveToPosition(long targetPosition)
 {
-  long stepsToMove = targetPosition - currentPosition;
+  long stepsToMove = targetPosition - getPosition();
 
   if (stepsToMove == 0)
   {
@@ -446,7 +615,7 @@ void homeToRetractedPosition()
   if (isRetractedLimitHit())
   {
     Serial.println("Retracted limit switch reached");
-    currentPosition = 0;
+    setPosition(0);
     retractedPosition = 0;
     Serial.println("Home position established");
   }
@@ -804,9 +973,8 @@ void setupWebServer()
     }
     lastAction = "Deploy command received";
     lastActionTime = millis();
-    deploy();
-    lastAction = "Blinds deployed";
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Blinds deployed\"}"); });
+    queueCommand(CMD_DEPLOY);
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Deploy command queued\"}"); });
 
   // API: Retract
   server.on("/api/retract", HTTP_POST, [](AsyncWebServerRequest *request)
@@ -817,18 +985,16 @@ void setupWebServer()
     }
     lastAction = "Retract command received";
     lastActionTime = millis();
-    retract();
-    lastAction = "Blinds retracted";
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Blinds retracted\"}"); });
+    queueCommand(CMD_RETRACT);
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Retract command queued\"}"); });
 
   // API: Calibrate
   server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest *request)
             {
     lastAction = "Calibration started";
     lastActionTime = millis();
-    calibrate();
-    lastAction = "Calibration complete";
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Calibration complete\"}"); });
+    queueCommand(CMD_CALIBRATE);
+    request->send(200, "application/json", "{\"success\":true,\"message\":\"Calibration command queued\"}"); });
 
   // API: Status
   server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -840,9 +1006,10 @@ void setupWebServer()
 
 String getStatusJSON()
 {
+  long pos = getPosition();
   String json = "{";
   json += "\"calibrated\":" + String(isCalibrated ? "true" : "false") + ",";
-  json += "\"currentPosition\":" + String(currentPosition) + ",";
+  json += "\"currentPosition\":" + String(pos) + ",";
   json += "\"deployedPosition\":" + String(deployedPosition) + ",";
   json += "\"retractedLimit\":" + String(isRetractedLimitHit() ? "true" : "false") + ",";
   json += "\"deployedLimit\":" + String(isDeployedLimitHit() ? "true" : "false") + ",";
