@@ -2,7 +2,18 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPmDNS.h>
+#include <EEPROM.h>
 #include "wifi_config.h"
+
+// EEPROM Configuration
+#define EEPROM_SIZE 512
+#define EEPROM_MAGIC_NUMBER 0xBD01 // Bird Blinds v1
+#define EEPROM_ADDR_MAGIC 0
+#define EEPROM_ADDR_DEPLOYED_POS 4
+#define EEPROM_ADDR_SAFETY_BUFFER 8
+
+// Safety buffer - stop this many steps before the deployed limit switch
+#define DEFAULT_SAFETY_BUFFER 200
 
 // Pin Definitions
 #define EN_PIN 25   // LOW: Driver enabled, HIGH: Driver disabled
@@ -17,10 +28,12 @@
 #define SPEED_DELAY 500 // Delay in microseconds between steps (controls speed)
 
 // Calibration and Position Tracking
-long currentPosition = 0;   // Current position in steps
-long retractedPosition = 0; // Calibrated retracted position (should be 0)
-long deployedPosition = 0;  // Calibrated deployed position
-bool isCalibrated = false;  // Calibration status
+long currentPosition = 0;                  // Current position in steps
+long retractedPosition = 0;                // Calibrated retracted position (should be 0)
+long deployedPosition = 0;                 // Calibrated deployed position (actual limit switch position)
+long safeDeployedPosition = 0;             // Safe deployed position (before limit switch)
+long safetyBuffer = DEFAULT_SAFETY_BUFFER; // Steps to stop before deployed limit
+bool isCalibrated = false;                 // Calibration status
 
 // Web Server
 AsyncWebServer server(80);
@@ -36,6 +49,9 @@ bool isDeployedLimitHit();
 void setupWiFi();
 void setupWebServer();
 String getStatusJSON();
+void saveCalibrationToEEPROM();
+bool loadCalibrationFromEEPROM();
+void homeToRetractedPosition();
 
 void setup()
 {
@@ -65,16 +81,31 @@ void setup()
   Serial.println("your switches may be normally-closed or wired incorrectly.");
   Serial.println("================================\n");
 
+  // Initialize EEPROM
+  EEPROM.begin(EEPROM_SIZE);
+
   // Setup WiFi and Web Server
   setupWiFi();
   setupWebServer();
 
-  Serial.println("Performing calibration...");
+  // Try to load stored calibration
+  if (loadCalibrationFromEEPROM())
+  {
+    Serial.println("Using stored calibration");
+    isCalibrated = true;
 
-  // Perform initial calibration
-  calibrate();
+    // Home to retracted position
+    homeToRetractedPosition();
 
-  Serial.println("Calibration complete!");
+    Serial.println("Ready! System is calibrated and homed.");
+  }
+  else
+  {
+    Serial.println("No stored calibration found. Performing full calibration...");
+    calibrate();
+    Serial.println("Calibration complete!");
+  }
+
   Serial.println("Commands: 'd' = deploy, 'r' = retract, 'c' = calibrate");
 }
 
@@ -167,14 +198,35 @@ void moveSteps(int steps, bool checkLimits)
     {
       if (forward && isDeployedLimitHit())
       {
-        Serial.println("Deployed limit reached");
+        Serial.println("WARNING: Deployed limit switch triggered!");
+
+        // Update the deployed endpoint if we hit the switch unexpectedly
+        if (currentPosition != deployedPosition)
+        {
+          Serial.print("Updating deployed endpoint from ");
+          Serial.print(deployedPosition);
+          Serial.print(" to ");
+          Serial.println(currentPosition);
+
+          deployedPosition = currentPosition;
+          safeDeployedPosition = deployedPosition - safetyBuffer;
+          saveCalibrationToEEPROM();
+        }
+
         currentPosition = deployedPosition;
         return;
       }
       if (!forward && isRetractedLimitHit())
       {
         Serial.println("Retracted limit reached");
-        currentPosition = retractedPosition;
+
+        // Always reset to zero when retracted limit is hit
+        if (currentPosition != 0)
+        {
+          Serial.println("Resetting position to 0");
+          currentPosition = 0;
+          retractedPosition = 0;
+        }
         return;
       }
     }
@@ -243,11 +295,22 @@ void calibrate()
   deployedPosition = stepCount;
   currentPosition = deployedPosition;
 
+  // Calculate safe deployed position (stop before limit switch)
+  safeDeployedPosition = deployedPosition - safetyBuffer;
+
   isCalibrated = true;
 
   Serial.print("Calibration complete. Range: 0 to ");
   Serial.print(deployedPosition);
   Serial.println(" steps");
+  Serial.print("Safe deployed position: ");
+  Serial.print(safeDeployedPosition);
+  Serial.print(" (");
+  Serial.print(safetyBuffer);
+  Serial.println(" steps before limit)");
+
+  // Save calibration to EEPROM
+  saveCalibrationToEEPROM();
 
   // Return to retracted position
   retract();
@@ -261,7 +324,11 @@ void deploy()
     return;
   }
 
-  moveToPosition(deployedPosition);
+  // Deploy to safe position (before the limit switch)
+  Serial.print("Deploying to safe position: ");
+  Serial.print(safeDeployedPosition);
+  Serial.println(" steps");
+  moveToPosition(safeDeployedPosition);
 }
 
 void retract()
@@ -302,6 +369,84 @@ bool isDeployedLimitHit()
 {
   // Assuming limit switches are normally open, active low with pullup
   return digitalRead(LIMIT_DEPLOYED) == LOW;
+}
+
+void saveCalibrationToEEPROM()
+{
+  Serial.println("Saving calibration to EEPROM...");
+  EEPROM.writeUShort(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_NUMBER);
+  EEPROM.writeLong(EEPROM_ADDR_DEPLOYED_POS, deployedPosition);
+  EEPROM.writeLong(EEPROM_ADDR_SAFETY_BUFFER, safetyBuffer);
+  EEPROM.commit();
+  Serial.println("Calibration saved");
+}
+
+bool loadCalibrationFromEEPROM()
+{
+  Serial.println("Checking for stored calibration...");
+
+  unsigned short magic = EEPROM.readUShort(EEPROM_ADDR_MAGIC);
+  if (magic != EEPROM_MAGIC_NUMBER)
+  {
+    Serial.println("No valid calibration found in EEPROM");
+    return false;
+  }
+
+  deployedPosition = EEPROM.readLong(EEPROM_ADDR_DEPLOYED_POS);
+  safetyBuffer = EEPROM.readLong(EEPROM_ADDR_SAFETY_BUFFER);
+
+  // Validate loaded values
+  if (deployedPosition <= 0 || deployedPosition > 100000)
+  {
+    Serial.println("Invalid calibration data in EEPROM");
+    return false;
+  }
+
+  safeDeployedPosition = deployedPosition - safetyBuffer;
+  retractedPosition = 0;
+
+  Serial.println("Loaded calibration from EEPROM:");
+  Serial.print("  Deployed position: ");
+  Serial.println(deployedPosition);
+  Serial.print("  Safety buffer: ");
+  Serial.println(safetyBuffer);
+  Serial.print("  Safe deployed position: ");
+  Serial.println(safeDeployedPosition);
+
+  return true;
+}
+
+void homeToRetractedPosition()
+{
+  Serial.println("Homing to retracted position...");
+
+  // Move towards retracted position until limit switch is hit
+  digitalWrite(DIR_PIN, LOW); // Direction to retracted
+  delayMicroseconds(10);
+
+  int maxSteps = 50000;
+  int stepCount = 0;
+
+  while (!isRetractedLimitHit() && stepCount < maxSteps)
+  {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(SPEED_DELAY);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(SPEED_DELAY);
+    stepCount++;
+  }
+
+  if (isRetractedLimitHit())
+  {
+    Serial.println("Retracted limit switch reached");
+    currentPosition = 0;
+    retractedPosition = 0;
+    Serial.println("Home position established");
+  }
+  else
+  {
+    Serial.println("Warning: Retracted limit not found during homing!");
+  }
 }
 
 void setupWiFi()
@@ -537,7 +682,6 @@ void setupWebServer()
         const response = await fetch('/api/' + cmd, { method: 'POST' });
         const data = await response.json();
         showMessage(data.message, data.success ? 'success' : 'error');
-        setTimeout(updateStatus, 500);
       } catch (error) {
         showMessage('Error: ' + error.message, 'error');
       }
@@ -551,7 +695,7 @@ void setupWebServer()
         document.getElementById('calibrated').textContent = data.calibrated ? 'YES' : 'NO';
         document.getElementById('position').textContent = data.position;
         document.getElementById('range').textContent = data.calibrated ? 
-          data.retractedPos + ' to ' + data.deployedPos : 'Not calibrated';
+          data.retractedPos + ' to ' + data.safeDeployedPos + ' (safe: ' + data.deployedPos + ')' : 'Not calibrated';
         document.getElementById('limitRetracted').textContent = data.limitRetracted ? 'TRIGGERED' : 'Not triggered';
         document.getElementById('limitDeployed').textContent = data.limitDeployed ? 'TRIGGERED' : 'Not triggered';
       } catch (error) {
@@ -559,8 +703,8 @@ void setupWebServer()
       }
     }
 
-    // Update status every 2 seconds
-    setInterval(updateStatus, 2000);
+    // Update status every 5 seconds (reduced from 2 to lower ESP32 load)
+    setInterval(updateStatus, 5000);
     updateStatus();
   </script>
 </body>
@@ -638,6 +782,8 @@ String getStatusJSON()
   json += "\"position\":" + String(currentPosition) + ",";
   json += "\"retractedPos\":" + String(retractedPosition) + ",";
   json += "\"deployedPos\":" + String(deployedPosition) + ",";
+  json += "\"safeDeployedPos\":" + String(safeDeployedPosition) + ",";
+  json += "\"safetyBuffer\":" + String(safetyBuffer) + ",";
   json += "\"limitRetracted\":" + String(isRetractedLimitHit() ? "true" : "false") + ",";
   json += "\"limitDeployed\":" + String(isDeployedLimitHit() ? "true" : "false");
   json += "}";
