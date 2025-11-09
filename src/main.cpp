@@ -52,6 +52,7 @@ bool loadCalibrationFromEEPROM();
 void homeToRetractedPosition();
 void setupWiFi();
 void setupWebServer();
+void checkWiFiConnection();
 String getStatusJSON();
 
 void setup()
@@ -114,6 +115,9 @@ void setup()
 
 void loop()
 {
+  // Monitor WiFi connection status
+  checkWiFiConnection();
+
   // Check for serial commands
   if (Serial.available() > 0)
   {
@@ -452,38 +456,154 @@ void homeToRetractedPosition()
   }
 }
 
+void checkWiFiConnection()
+{
+  static unsigned long lastCheck = 0;
+  static bool wasConnected = false;
+
+  // Check WiFi status every 10 seconds
+  if (millis() - lastCheck > 10000)
+  {
+    lastCheck = millis();
+
+    bool isConnected = WiFi.status() == WL_CONNECTED;
+
+    // Only log on status change
+    if (isConnected != wasConnected)
+    {
+      wasConnected = isConnected;
+
+      if (isConnected)
+      {
+        Serial.println("\n[WiFi] Connected!");
+        Serial.print("[WiFi] IP: ");
+        Serial.println(WiFi.localIP());
+        lastAction = "WiFi reconnected";
+      }
+      else
+      {
+        Serial.println("\n[WiFi] Disconnected - attempting reconnect...");
+        lastAction = "WiFi disconnected";
+        // Auto-reconnect should handle this, but we can force it
+        WiFi.reconnect();
+      }
+    }
+  }
+}
+
 void setupWiFi()
 {
   Serial.println("\n=== WiFi Setup ===");
+
+// ESP32-S3 specific: Add delay for USB CDC stability
+#ifdef ARDUINO_USB_CDC_ON_BOOT
+  Serial.println("USB CDC detected - adding initialization delay");
+  delay(5000);
+#endif
+
+  // Disconnect any previous connection and clear config
+  WiFi.disconnect(true);
+  delay(100);
+
+  // Disable WiFi persistence to avoid NVS conflicts
+  WiFi.persistent(false);
+
+  // Set WiFi to station mode
+  WiFi.mode(WIFI_STA);
+
+  // ESP32-S3 requires delay after mode change
+  delay(100);
+
+  // Disable auto-reconnect initially to have better control
+  WiFi.setAutoReconnect(false);
+
+  // Set WiFi power saving to none for reliable connection
+  WiFi.setSleep(false);
+
   Serial.print("Connecting to ");
   Serial.println(WIFI_SSID);
+  Serial.print("MAC Address: ");
+  Serial.println(WiFi.macAddress());
 
-  WiFi.mode(WIFI_STA);
+  // Begin connection
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
+  // Wait for connection with detailed status reporting
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
+  while (WiFi.status() != WL_CONNECTED && attempts < 40)
   {
     delay(500);
     Serial.print(".");
+
+    // Print status every 5 attempts
+    if ((attempts + 1) % 5 == 0)
+    {
+      Serial.println();
+      Serial.print("Status: ");
+      switch (WiFi.status())
+      {
+      case WL_IDLE_STATUS:
+        Serial.println("IDLE");
+        break;
+      case WL_NO_SSID_AVAIL:
+        Serial.println("NO SSID AVAILABLE");
+        break;
+      case WL_SCAN_COMPLETED:
+        Serial.println("SCAN COMPLETED");
+        break;
+      case WL_CONNECT_FAILED:
+        Serial.println("CONNECT FAILED");
+        break;
+      case WL_CONNECTION_LOST:
+        Serial.println("CONNECTION LOST");
+        break;
+      case WL_DISCONNECTED:
+        Serial.println("DISCONNECTED");
+        break;
+      default:
+        Serial.print("UNKNOWN (");
+        Serial.print(WiFi.status());
+        Serial.println(")");
+      }
+    }
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println("\nWiFi connected!");
+    Serial.println("\n\nWiFi connected!");
     Serial.print("IP Address: ");
     Serial.println(WiFi.localIP());
+    Serial.print("Gateway: ");
+    Serial.println(WiFi.gatewayIP());
+    Serial.print("Subnet: ");
+    Serial.println(WiFi.subnetMask());
+    Serial.print("DNS: ");
+    Serial.println(WiFi.dnsIP());
     Serial.print("Signal Strength: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
+    Serial.print("Channel: ");
+    Serial.println(WiFi.channel());
+
+    // Now enable auto-reconnect for stability
+    WiFi.setAutoReconnect(true);
+
     lastAction = "WiFi connected";
     lastActionTime = millis();
   }
   else
   {
-    Serial.println("\nWiFi connection failed!");
-    Serial.println("Controller will still work via serial commands");
+    Serial.println("\n\nWiFi connection failed!");
+    Serial.print("Final status: ");
+    Serial.println(WiFi.status());
+    Serial.println("\nTroubleshooting:");
+    Serial.println("1. Verify SSID and password in wifi_config.h");
+    Serial.println("2. Check if router is on 2.4GHz (ESP32 doesn't support 5GHz)");
+    Serial.println("3. Try moving ESP32 closer to router");
+    Serial.println("4. Check if router has MAC filtering enabled");
+    Serial.println("\nController will still work via serial commands");
     lastAction = "WiFi connection failed";
     lastActionTime = millis();
   }
