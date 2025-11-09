@@ -6,7 +6,7 @@ This is an ESP32-based stepper motor controller for automated window blinds used
 
 ## Architecture
 
-- **Platform:** ESP32 (espressif32)
+- **Platform:** ESP32-S3 (espressif32)
 - **Framework:** Arduino
 - **Build System:** PlatformIO
 - **Motor Driver:** TMC2209 in standalone mode

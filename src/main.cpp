@@ -1,9 +1,5 @@
 #include <Arduino.h>
-#include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <ESPmDNS.h>
 #include <EEPROM.h>
-#include "wifi_config.h"
 
 // EEPROM Configuration
 #define EEPROM_SIZE 512
@@ -16,13 +12,13 @@
 #define DEFAULT_SAFETY_BUFFER 200
 
 // Pin Definitions
-#define EN_PIN 25   // LOW: Driver enabled, HIGH: Driver disabled
-#define STEP_PIN 26 // Step on the rising edge
-#define DIR_PIN 27  // Direction control
+#define EN_PIN 4   // LOW: Driver enabled, HIGH: Driver disabled
+#define STEP_PIN 5 // Step on the rising edge
+#define DIR_PIN 6  // Direction control
 
 // Limit Switch Pins
-#define LIMIT_RETRACTED 32 // Limit switch for fully retracted position
-#define LIMIT_DEPLOYED 33  // Limit switch for fully deployed position
+#define LIMIT_RETRACTED 15 // Limit switch for fully retracted position
+#define LIMIT_DEPLOYED 16  // Limit switch for fully deployed position
 
 // Motor Configuration
 #define SPEED_DELAY 500 // Delay in microseconds between steps (controls speed)
@@ -35,9 +31,6 @@ long safeDeployedPosition = 0;             // Safe deployed position (before lim
 long safetyBuffer = DEFAULT_SAFETY_BUFFER; // Steps to stop before deployed limit
 bool isCalibrated = false;                 // Calibration status
 
-// Web Server
-AsyncWebServer server(80);
-
 // Function Declarations
 void moveSteps(int steps, bool checkLimits = true);
 void calibrate();
@@ -46,9 +39,6 @@ void retract();
 void moveToPosition(long targetPosition);
 bool isRetractedLimitHit();
 bool isDeployedLimitHit();
-void setupWiFi();
-void setupWebServer();
-String getStatusJSON();
 void saveCalibrationToEEPROM();
 bool loadCalibrationFromEEPROM();
 void homeToRetractedPosition();
@@ -83,10 +73,6 @@ void setup()
 
   // Initialize EEPROM
   EEPROM.begin(EEPROM_SIZE);
-
-  // Setup WiFi and Web Server
-  setupWiFi();
-  setupWebServer();
 
   // Try to load stored calibration
   if (loadCalibrationFromEEPROM())
@@ -447,345 +433,4 @@ void homeToRetractedPosition()
   {
     Serial.println("Warning: Retracted limit not found during homing!");
   }
-}
-
-void setupWiFi()
-{
-  Serial.println("\n=== WiFi Setup ===");
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20)
-  {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-
-    // Setup mDNS
-    if (MDNS.begin("birdblinds"))
-    {
-      Serial.println("mDNS responder started");
-      Serial.println("Access at: http://birdblinds.local");
-      MDNS.addService("http", "tcp", 80);
-    }
-    else
-    {
-      Serial.println("Error setting up mDNS responder!");
-    }
-  }
-  else
-  {
-    Serial.println("\nWiFi connection failed!");
-    Serial.println("Check credentials in wifi_config.h");
-  }
-  Serial.println("==================\n");
-}
-
-void setupWebServer()
-{
-  // Serve the main HTML page
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
-    String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Bird Blinds Controller</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      padding: 20px;
-    }
-    .container {
-      background: white;
-      border-radius: 20px;
-      padding: 40px;
-      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-      max-width: 500px;
-      width: 100%;
-    }
-    h1 {
-      color: #333;
-      text-align: center;
-      margin-bottom: 10px;
-      font-size: 28px;
-    }
-    .subtitle {
-      text-align: center;
-      color: #666;
-      margin-bottom: 30px;
-      font-size: 14px;
-    }
-    .status {
-      background: #f5f5f5;
-      padding: 20px;
-      border-radius: 10px;
-      margin-bottom: 30px;
-    }
-    .status-item {
-      display: flex;
-      justify-content: space-between;
-      padding: 8px 0;
-      border-bottom: 1px solid #ddd;
-    }
-    .status-item:last-child { border-bottom: none; }
-    .status-label {
-      font-weight: 600;
-      color: #555;
-    }
-    .status-value {
-      color: #667eea;
-      font-weight: 600;
-    }
-    .controls {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 15px;
-      margin-bottom: 20px;
-    }
-    .btn {
-      padding: 15px 20px;
-      border: none;
-      border-radius: 10px;
-      font-size: 16px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.3s;
-      color: white;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-    }
-    .btn:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(0,0,0,0.2);
-    }
-    .btn:active {
-      transform: translateY(0);
-    }
-    .btn-deploy {
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-    }
-    .btn-retract {
-      background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-    }
-    .btn-calibrate {
-      background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-      grid-column: span 2;
-    }
-    .btn-test {
-      background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
-    }
-    .btn-status {
-      background: linear-gradient(135deg, #fa709a 0%, #fee140 100%);
-    }
-    .message {
-      margin-top: 20px;
-      padding: 15px;
-      border-radius: 10px;
-      text-align: center;
-      display: none;
-      font-weight: 600;
-    }
-    .message.success {
-      background: #d4edda;
-      color: #155724;
-      display: block;
-    }
-    .message.error {
-      background: #f8d7da;
-      color: #721c24;
-      display: block;
-    }
-    .message.info {
-      background: #d1ecf1;
-      color: #0c5460;
-      display: block;
-    }
-    @media (max-width: 480px) {
-      .container { padding: 25px; }
-      h1 { font-size: 24px; }
-      .btn { padding: 12px 15px; font-size: 14px; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>🦅 Bird Blinds Controller</h1>
-    <p class="subtitle">ESP32 Stepper Motor Control</p>
-    
-    <div class="status" id="statusDisplay">
-      <div class="status-item">
-        <span class="status-label">Calibrated:</span>
-        <span class="status-value" id="calibrated">Loading...</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">Current Position:</span>
-        <span class="status-value" id="position">-</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">Range:</span>
-        <span class="status-value" id="range">-</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">Retracted Limit:</span>
-        <span class="status-value" id="limitRetracted">-</span>
-      </div>
-      <div class="status-item">
-        <span class="status-label">Deployed Limit:</span>
-        <span class="status-value" id="limitDeployed">-</span>
-      </div>
-    </div>
-    
-    <div class="controls">
-      <button class="btn btn-deploy" onclick="sendCommand('deploy')">Deploy</button>
-      <button class="btn btn-retract" onclick="sendCommand('retract')">Retract</button>
-      <button class="btn btn-calibrate" onclick="sendCommand('calibrate')">Calibrate</button>
-      <button class="btn btn-test" onclick="sendCommand('test')">Test Motor</button>
-      <button class="btn btn-status" onclick="updateStatus()">Refresh Status</button>
-    </div>
-    
-    <div class="message" id="message"></div>
-  </div>
-
-  <script>
-    function showMessage(msg, type) {
-      const msgEl = document.getElementById('message');
-      msgEl.textContent = msg;
-      msgEl.className = 'message ' + type;
-      setTimeout(() => {
-        msgEl.className = 'message';
-      }, 5000);
-    }
-
-    async function sendCommand(cmd) {
-      try {
-        showMessage('Sending command...', 'info');
-        const response = await fetch('/api/' + cmd, { method: 'POST' });
-        const data = await response.json();
-        showMessage(data.message, data.success ? 'success' : 'error');
-      } catch (error) {
-        showMessage('Error: ' + error.message, 'error');
-      }
-    }
-
-    async function updateStatus() {
-      try {
-        const response = await fetch('/api/status');
-        const data = await response.json();
-        
-        document.getElementById('calibrated').textContent = data.calibrated ? 'YES' : 'NO';
-        document.getElementById('position').textContent = data.position;
-        document.getElementById('range').textContent = data.calibrated ? 
-          data.retractedPos + ' to ' + data.safeDeployedPos + ' (safe: ' + data.deployedPos + ')' : 'Not calibrated';
-        document.getElementById('limitRetracted').textContent = data.limitRetracted ? 'TRIGGERED' : 'Not triggered';
-        document.getElementById('limitDeployed').textContent = data.limitDeployed ? 'TRIGGERED' : 'Not triggered';
-      } catch (error) {
-        console.error('Failed to update status:', error);
-      }
-    }
-
-    // Update status every 5 seconds (reduced from 2 to lower ESP32 load)
-    setInterval(updateStatus, 5000);
-    updateStatus();
-  </script>
-</body>
-</html>
-)rawliteral";
-    request->send(200, "text/html", html); });
-
-  // API endpoint: Deploy
-  server.on("/api/deploy", HTTP_POST, [](AsyncWebServerRequest *request)
-            {
-    if (!isCalibrated) {
-      request->send(200, "application/json", "{\"success\":false,\"message\":\"Not calibrated. Run calibration first.\"}");
-      return;
-    }
-    Serial.println("Web: Deploying blinds...");
-    deploy();
-    Serial.println("Web: Blinds deployed");
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Blinds deployed successfully\"}"); });
-
-  // API endpoint: Retract
-  server.on("/api/retract", HTTP_POST, [](AsyncWebServerRequest *request)
-            {
-    if (!isCalibrated) {
-      request->send(200, "application/json", "{\"success\":false,\"message\":\"Not calibrated. Run calibration first.\"}");
-      return;
-    }
-    Serial.println("Web: Retracting blinds...");
-    retract();
-    Serial.println("Web: Blinds retracted");
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Blinds retracted successfully\"}"); });
-
-  // API endpoint: Calibrate
-  server.on("/api/calibrate", HTTP_POST, [](AsyncWebServerRequest *request)
-            {
-    Serial.println("Web: Starting calibration...");
-    calibrate();
-    Serial.println("Web: Calibration complete");
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Calibration completed successfully\"}"); });
-
-  // API endpoint: Test motor
-  server.on("/api/test", HTTP_POST, [](AsyncWebServerRequest *request)
-            {
-    Serial.println("Web: Test - Moving 100 steps forward...");
-    digitalWrite(DIR_PIN, HIGH);
-    for (int i = 0; i < 100; i++)
-    {
-      digitalWrite(STEP_PIN, HIGH);
-      delayMicroseconds(SPEED_DELAY);
-      digitalWrite(STEP_PIN, LOW);
-      delayMicroseconds(SPEED_DELAY);
-    }
-    Serial.println("Web: Test complete");
-    request->send(200, "application/json", "{\"success\":true,\"message\":\"Test movement completed\"}"); });
-
-  // API endpoint: Get status
-  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
-    String json = getStatusJSON();
-    request->send(200, "application/json", json); });
-
-  // Start server
-  server.begin();
-  Serial.println("Web server started on port 80");
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.print("Access the interface at: http://");
-    Serial.println(WiFi.localIP());
-  }
-}
-
-String getStatusJSON()
-{
-  String json = "{";
-  json += "\"calibrated\":" + String(isCalibrated ? "true" : "false") + ",";
-  json += "\"position\":" + String(currentPosition) + ",";
-  json += "\"retractedPos\":" + String(retractedPosition) + ",";
-  json += "\"deployedPos\":" + String(deployedPosition) + ",";
-  json += "\"safeDeployedPos\":" + String(safeDeployedPosition) + ",";
-  json += "\"safetyBuffer\":" + String(safetyBuffer) + ",";
-  json += "\"limitRetracted\":" + String(isRetractedLimitHit() ? "true" : "false") + ",";
-  json += "\"limitDeployed\":" + String(isDeployedLimitHit() ? "true" : "false");
-  json += "}";
-  return json;
 }
